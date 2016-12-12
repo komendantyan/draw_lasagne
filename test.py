@@ -17,10 +17,9 @@ import optimizers
 
 
 BATCH_SIZE = 100
-NB_EPOCH = 50
+NB_EPOCH = 500
 EARLY_STOPPING_STEPS = 3
-EARLY_STOPPING_ACCURACY = 1e-3
-
+EARLY_STOPPING_ACCURACY = 1e-4
 
 logger = logging.getLogger(__name__)
 
@@ -31,14 +30,17 @@ class Model(models.BaseModel):
         config.pop('self')
         super(Model, self).__init__(**config)
 
+        self.subcells['bn_1'] = cells.BatchNormalizationCell((self.config['batch_size'], 28**2))
         self.subcells['dense_1'] = cells.DenseCell(28**2, 10, T.nnet.relu)
+        self.subcells['bn_2'] = cells.BatchNormalizationCell((self.config['batch_size'], 10))
         self.subcells['dense_2'] = cells.DenseCell(10, 28**2, T.nnet.sigmoid)
 
     def __call__(self):
         x = T.matrix('x')
-
-        encoded = self.subcells['dense_1'](x)
-        decoded = self.subcells['dense_2'](encoded)
+        x_norm = self.subcells['bn_1'](x)
+        encoded = self.subcells['dense_1'](x_norm)
+        encoded_norm = self.subcells['bn_2'](encoded)
+        decoded = self.subcells['dense_2'](encoded_norm)
 
         loss = T.mean(T.nnet.binary_crossentropy(decoded, x))
 
@@ -67,7 +69,7 @@ if __name__ == '__main__':
         BATCH_SIZE,
         optimizer=functools.partial(
             optimizers.adadelta,
-            gamma_dtheta=0.1, gamma_g=0.1, learning_rate=1e-1
+            gamma_g=0.95, gamma_dtheta=0.95, learning_rate=1.0
         )
     )
     model()
@@ -90,7 +92,7 @@ if __name__ == '__main__':
                         epoch, NB_EPOCH, val_loss[-1], delta_val_loss,
                         stagnation_steps, EARLY_STOPPING_STEPS)
             if stagnation_steps == EARLY_STOPPING_STEPS:
-                logger.info('%r stagnation steps, early stopping')
+                logger.info('early stopping')
                 break
 
     except KeyboardInterrupt:
@@ -101,4 +103,5 @@ if __name__ == '__main__':
     logger.info('finally val_loss=%f', model.loss(test_data))
 
     predict_data = model.predict(test_data)
-    
+    numpy.save('./predict_data.npy', predict_data)
+    numpy.save('./test_data.npy', test_data)

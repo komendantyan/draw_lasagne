@@ -6,11 +6,13 @@ import abc
 from collections import OrderedDict
 import logging
 
+import numpy
+
 import theano
 import theano.tensor as T
 from theano.sandbox.rng_mrg import MRG_RandomStreams as RandomStreams
 
-from utils import truncnorm, positive_clip
+from utils import glorot_uniform, positive_clip
 
 
 logger = logging.getLogger(__name__)
@@ -62,9 +64,9 @@ class DenseCell(BaseCell):
         super(DenseCell, self).__init__(**config)
 
         self.weights['W'] = theano.shared(
-            truncnorm((input_size, output_size)) / (input_size + output_size))
+            glorot_uniform((input_size, output_size)))
         self.weights['b'] = theano.shared(
-            truncnorm((output_size,)) / output_size)
+            glorot_uniform((output_size,)))
 
     def __call__(self, x):
         y = T.dot(x, self.weights['W']) + self.weights['b']
@@ -195,3 +197,23 @@ class SamplingCell(BaseCell):
         logvar2 = self.subcells['z_logvar2'](h)
 
         return mean + T.exp(logvar2 / 2) * self._epsilon
+
+
+class BatchNormalizationCell(BaseCell):
+    def __init__(self, shape, epsilon=1e-7):
+        config = vars()
+        config.pop('self')
+        super(BatchNormalizationCell, self).__init__(**config)
+
+        self.weights['gamma'] = theano.shared(numpy.ones(shape, 'float32'))
+        self.weights['beta'] = theano.shared(numpy.ones(shape, 'float32'))
+
+    def __call__(self, x):
+        mean = T.mean(x, 0, keepdims=True)
+        std = T.sqrt(T.mean(T.sqr(x - mean), 0, keepdims=True)) + \
+            self.config['epsilon']
+
+        y = T.nnet.bn.batch_normalization(
+            x, self.weights['gamma'], self.weights['beta'], mean, std)
+
+        return y

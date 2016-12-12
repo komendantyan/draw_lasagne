@@ -1,12 +1,21 @@
+from __future__ import division
+
 import numpy
-import scipy.stats
 
 import theano.tensor as T
 
 
-def truncnorm(shape):
-    rvs = scipy.stats.truncnorm(-3.0, 3.0).rvs
-    return rvs(shape).astype('float32')
+def glorot_uniform(shape):
+    if len(shape) == 1:
+        fan_in = fan_out = shape[0] ** 0.5
+    elif len(shape) == 2:
+        fan_in = shape[0]
+        fan_out = shape[1]
+    else:
+        raise NotImplementedError('glorot_uniform, len(shape) > 2')
+
+    s = (6 / (fan_in + fan_out)) ** 0.5
+    return numpy.random.uniform(-s, s, shape).astype('float32')
 
 
 def positive_clip(x, eps=1e-7):

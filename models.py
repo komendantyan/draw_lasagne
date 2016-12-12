@@ -35,7 +35,8 @@ class BaseModel(cells.BaseCell):
         else:
             return numpy.concatenate([
                 self._batch_predict(batch_data)
-                for batch_data in iter_batches(data, self.config['batch_size'])
+                for batch_data in iter_batches(data, self.config['batch_size'],
+                                               shuffle=False)
             ])
 
 
