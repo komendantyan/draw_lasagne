@@ -6,156 +6,266 @@
 from __future__ import division
 
 import logging
+import cPickle
 
 import numpy
 import theano
 import theano.tensor as T
 
-import cells
-import models
-from utils import (
-    truncnorm,
-    iter_batches,
+import lasagne
+from lasagne import (
+    layers as ll,
+    nonlinearities as ln,
+    init as li,
 )
-import optimizers
+
+import advanced_layers
+import utils
 
 
-BATCH_SIZE = 100
-Z_NDIM = 3
-Z_EPSILON = 1e-2
-TIME_ROUNDS = 5
-NB_EPOCH = 0
+BS = 32
+CH = 1
+IH = 28
+IW = 28
+WH = 7
+WW = 7
+
+HS = 100
+
+ENC_NDIM = 5
+ENC_VAR = 1.0
+
+TIME_ROUNDS = 2
+
+NB_EPOCHS = 500
+EARLY_STOPPING_STEPS = 3
+EARLY_STOPPING_ACCURACY = 1e-4
 
 
-class Model(models.BaseModel):
-    def __init__(self, batch_size, image_shape, window_shape, internal_size,
-                 z_ndim, z_epsilon, time_rounds):
-        config = vars()
-        config.pop('self')
-        super(Model, self).__init__(**config)
+logging.basicConfig(
+    format=(
+        "[%(asctime)s %(relativeCreated)8d] "
+        "[%(levelname).1s]\t%(message)s"
+    ),
+    datefmt="%F %T",
+    level=logging.INFO
+)
+logger = logging.getLogger(__name__)
 
-        self.internal['h_enc'] = [theano.shared(truncnorm((batch_size, internal_size)))]
-        self.internal['h_dec'] = [theano.shared(truncnorm((batch_size, internal_size)))]
-        self.internal['c_enc'] = [theano.shared(truncnorm((batch_size, internal_size)))]
-        self.internal['c_dec'] = [theano.shared(truncnorm((batch_size, internal_size)))]
-        self.internal['canvas'] = [
-            theano.shared(numpy.zeros((batch_size,) + image_shape, 'float32'))
-        ]
 
-        self.subcells['read'] = cells.ReadCell(batch_size, internal_size, image_shape, window_shape)
-        self.subcells['lstm_enc'] = cells.LSTMCell(
-            2 * numpy.prod(window_shape) + internal_size,
-            internal_size
+def make_model():
+    image = ll.InputLayer(
+        (BS, CH, IH, IW),
+        name='step1.image'
+    )
+
+    h_read = ll.InputLayer(
+        (BS, HS),
+        lasagne.utils.create_param(li.Uniform(), (BS, HS),
+                                   name='step1.tensor.h_read'),
+        name='step1.h_read'
+    )
+    h_read.add_param(h_read.input_var, (BS, HS))
+
+    h_write = ll.InputLayer(
+        (BS, HS),
+        lasagne.utils.create_param(li.Uniform(), (BS, HS),
+                                   name='step1.tensor.h_write'),
+        name='step1.h_write'
+    )
+    h_write.add_param(h_write.input_var, (BS, HS))
+
+    canvas = ll.InputLayer(
+        (BS, CH, IH, IW),
+        lasagne.utils.create_param(li.Constant(0.0), (BS, CH, IH, IW),
+                                   name='step1.tensor.canvas'),
+        name='step1.canvas'
+    )
+
+    image_prev = ll.NonlinearityLayer(canvas, ln.sigmoid,
+                                      name='step1.image_prev')
+
+    image_error = ll.ElemwiseSumLayer([image, image_prev], coeffs=[1, -1],
+                                      name='step1.image_error')
+    image_stack = ll.ConcatLayer([image, image_error],
+                                 name='step1.image_stack')
+
+    read_params = ll.DenseLayer(h_write, 6, nonlinearity=None,
+                                name='step1.read_params')
+    read_window = advanced_layers.AttentionLayer(
+        [read_params, image_stack], (WH, WW), name='step1.read_window')
+
+    read_flat = ll.FlattenLayer(read_window, name='step1.read_flat')
+    read_code = ll.ConcatLayer([read_flat, h_write], name='step1.read_code')
+
+    read_code_sequence = ll.ReshapeLayer(
+        read_code, (BS, 1, read_code.output_shape[-1]),
+        name='step1.read_code_sequence'
+    )
+
+    read_rnn = ll.GRULayer(
+        read_code_sequence, HS, only_return_final=True,
+        hid_init=h_read,
+        name='step1.read_rnn',
+    )
+
+    sample_mean = ll.DenseLayer(read_rnn, ENC_NDIM, nonlinearity=None,
+                                name='step1.sample_mean')
+    sample_logvar2 = ll.DenseLayer(read_rnn, ENC_NDIM, nonlinearity=None,
+                                   name='step1.sample_logvar2')
+    sample = advanced_layers.SamplingLayer(
+        [sample_mean, sample_logvar2], ENC_VAR,
+        name='step1.sample'
+    )
+
+    write_code = ll.DenseLayer(sample, HS, name='step1.write_code')
+    write_code_sequence = ll.ReshapeLayer(
+        write_code, (BS, 1, write_code.output_shape[-1]),
+        name='step1.write_code_sequence'
+    )
+    write_rnn = ll.GRULayer(
+        write_code_sequence, HS, only_return_final=True,
+        hid_init=h_write,
+        name='step1.write_rnn',
+    )
+    write_window_flat = ll.DenseLayer(write_rnn, CH * WH * WW,
+                                      name='step1.write_window_flat')
+    write_window = ll.ReshapeLayer(write_window_flat, (BS, CH, WH, WW),
+                                   name='step1.write_window')
+
+    write_params = ll.DenseLayer(h_write, 6, nonlinearity=None,
+                                 name='step1.write_params')
+    write_image = advanced_layers.AttentionLayer(
+        [write_params, write_window], (IH, IW),
+        name='step1.write_image'
+    )
+    canvas_next = ll.ElemwiseSumLayer([canvas, write_image],
+                                      name='step1.canvas_next')
+
+    def rename_rule(name):
+        if name is None:
+            return None
+        step, real_name = name.split('.', 1)
+        step = int(step[4:])
+        return 'step%d.%s' % (step + 1, real_name)
+
+    for step in xrange(1, TIME_ROUNDS):
+        sample_random_variable_next = sample.random_stream.normal(
+            sample.input_shapes[0],
+            std=sample.variation_coeff,
         )
-        self.subcells['sampling'] = cells.SamplingCell(batch_size, internal_size, z_ndim, z_epsilon)
-        self.subcells['lstm_dec'] = cells.LSTMCell(z_ndim, internal_size)
-        self.subcells['post_dec'] = cells.DenseCell(internal_size, numpy.prod(window_shape), None)
-        self.subcells['write'] = cells.WriteCell(batch_size, internal_size, image_shape, window_shape)
+        sample_random_variable_next.name = 'step%d.sample.random_variable' % \
+            (step + 1)
 
-    def __call__(self):
-        x = T.tensor4('x')
-
-        for t in xrange(self.config['time_rounds']):
-            x_err = x - T.nnet.sigmoid(self.internal['canvas'][-1])
-            r = self.subcells['read'](self.internal['h_dec'][-1], T.concatenate([x, x_err], 1))
-            h_enc_next, c_enc_next = self.subcells['lstm_enc'](
-                T.concatenate([self.internal['h_dec'][-1], T.flatten(r, 2)], 1),
-                self.internal['h_enc'][-1],
-                self.internal['c_enc'][-1],
-            )
-            self.internal['h_enc'].append(h_enc_next)
-            self.internal['c_enc'].append(c_enc_next)
-
-            z = self.subcells['sampling'](self.internal['h_enc'][-1])
-
-            h_dec_next, c_dec_next = self.subcells['lstm_dec'](
-                z,
-                self.internal['h_dec'][-1],
-                self.internal['c_dec'][-1]
-            )
-            self.internal['h_dec'].append(h_dec_next)
-            self.internal['c_dec'].append(c_dec_next)
-
-            post_dec = self.subcells['post_dec'](self.internal['h_dec'][-1]).reshape(
-                (self.config['batch_size'],) + self.config['window_shape'])
-            canvas_next = self.internal['canvas'][-1] + \
-                self.subcells['write'](self.internal['h_dec'][-1], post_dec)
-            self.internal['canvas'].append(canvas_next)
-
-        output = T.nnet.sigmoid(self.internal['canvas'][-1])
-        loss = T.mean(T.nnet.binary_crossentropy(output, x)) * self.config['batch_size']
-
-        self.internal['input'] = x
-        self.internal['output'] = output
-        self.internal['loss'] = loss
-
-        self.predict = theano.function([x], output)
-        self.fit = theano.function(
-            [x],
-            loss,
-            updates=optimizers.adadelta(
-                loss,
-                self.descendants_weighs,
-                0.1, 0.1, 1.0
+        canvas, canvas_next = (
+            canvas_next,
+            utils.modified_copy(
+                canvas_next,
+                start_layers=[h_read, h_write, canvas],
+                modify={
+                    h_read: read_rnn,
+                    h_write: write_rnn,
+                    canvas: canvas_next,
+                    sample.random_stream: sample.random_stream,
+                    sample.random_variable: sample_random_variable_next,
+                },
+                rename_rule=rename_rule,
             )
         )
-        self.loss = theano.function([x], loss)
+
+        h_read = read_rnn
+        h_write = write_rnn
+        read_rnn = utils.layer_by_name(canvas_next, 'step%d.read_rnn' % (step + 1))
+        write_rnn = utils.layer_by_name(canvas_next, 'step%d.write_rnn' % (step + 1))
+        sample = utils.layer_by_name(canvas_next, 'step%d.sample' % (step + 1))
+
+    output = ll.NonlinearityLayer(canvas_next, ln.sigmoid,
+                                  name='output')
+
+    return output
 
 
 if __name__ == '__main__':
-    logging.basicConfig(
-        format=(
-            "[%(asctime)s %(relativeCreated)8d] "
-            "[%(levelname).1s]\t%(message)s"
-        ),
-        datefmt="%F %T",
-        level=logging.INFO
+    mnist = utils.load_mnist()
+    model = make_model()
+
+    image = utils.layer_by_name(model, 'step1.image').input_var
+
+    output_layers = [
+        utils.layer_by_name(model, name)
+        for name in (
+            ['output'] +
+            ['step%d.sample_mean' % j for j in range(1, TIME_ROUNDS + 1)] +
+            ['step%d.sample_logvar2' % j for j in range(1, TIME_ROUNDS + 1)]
+        )
+    ]
+
+    output_tensors = ll.get_output(output_layers)
+    output = output_tensors[0]
+    mean = output_tensors[1: 1 + TIME_ROUNDS]
+    logvar2 = output_tensors[1 + TIME_ROUNDS: 1 + 2 * TIME_ROUNDS]
+
+    bc_loss = T.mean(lasagne.objectives.binary_crossentropy(output, image))
+    kl_loss = T.mean([
+        0.5 * T.mean(mean[step] ** 2 + T.exp(logvar2[step]) - logvar2[step] - 1)
+        for step in range(TIME_ROUNDS)
+    ])
+    loss = bc_loss + 0.01 * kl_loss
+
+    params = lasagne.layers.get_all_params(model, trainable=True)
+    updates = lasagne.updates.adadelta(loss, params)
+
+    f_train_batch = theano.function(
+        [image], loss, updates=updates,
+        # mode=theano.compile.MonitorMode(post_func=inspect_node)
     )
-    logging.info('logging initialized')
+    f_test_batch = theano.function(
+        [image], loss,
+        # mode=theano.compile.MonitorMode(post_func=inspect_node)
+    )
+    f_predict_batch = theano.function(
+        [image], output,
+        # mode=theano.compile.MonitorMode(post_func=inspect_node)
+    )
+    f_raw_loss_batch = theano.function(
+        [image], bc_loss
+    )
 
-    model = Model(BATCH_SIZE, (1, 28, 28), (1, 7, 7),
-                  100, Z_NDIM, Z_EPSILON, TIME_ROUNDS)
-    logging.info('model created')
-    model()
-    logging.info('model built')
+    f_train = utils.batch_wrapper(f_train_batch, BS, aggregate=numpy.mean)
+    f_test = utils.batch_wrapper(f_test_batch, BS, aggregate=numpy.mean)
+    f_predict = utils.batch_wrapper(f_predict_batch, BS, cut=True, shuffle=False)
+    f_raw_loss = utils.batch_wrapper(f_raw_loss_batch, BS, aggregate=numpy.mean)
 
-    from keras.datasets import mnist
-    mnist = mnist.load_data()
-    train_data = (mnist[0][0] / 255.0).astype('float32').reshape((-1, 1, 28, 28))
-    test_data = (mnist[1][0] / 255.0).astype('float32').reshape((-1, 1, 28, 28))
-    logging.info('dataset loaded')
+    logger.info('initial val_loss=%f, raw_loss=%f',
+                f_test(mnist[1][0]), f_raw_loss(mnist[1][0]))
 
-    # model.load_weights('weights.pkl')
-    # logging.info('weights loaded')
-
-    logging.info('Starting training')
     try:
-        for epoch in range(1, NB_EPOCH + 1):
-            logging.info('epoch %d/%d started', epoch, NB_EPOCH)
+        val_loss = []
+        for epoch in range(1, NB_EPOCHS + 1):
+            train_loss = f_train(mnist[0][0], _verbose=True)
+            val_loss.append(f_test(mnist[1][0]))
+            raw_loss = f_raw_loss(mnist[1][0])
 
-            for j, batch_data in enumerate(iter_batches(train_data, BATCH_SIZE)):
-                train_loss = model.fit(batch_data)
-                if j % 10 == 0:
-                    logging.debug('epoch %4d/%d, objects %5d/60000, train_loss=%f',
-                                 epoch, NB_EPOCH, j * BATCH_SIZE, train_loss / BATCH_SIZE)
+            logger.info(
+                'epoch %3d/%d, train_loss=%f, val_loss=%f, raw_loss=%f',
+                epoch, NB_EPOCHS, train_loss, val_loss[-1], raw_loss
+            )
 
-            val_loss = 0.0
-            for batch_data in iter_batches(test_data, BATCH_SIZE, shuffle=False):
-                val_loss += model.loss(batch_data)
-            logging.info('epoch %3d/%d, val_loss=%f',
-                         epoch, NB_EPOCH, val_loss / test_data.shape[0])
+            if epoch > EARLY_STOPPING_STEPS:
+                recent_best = min(val_loss[-EARLY_STOPPING_STEPS:])
+                best = val_loss[-(EARLY_STOPPING_STEPS+1)]
+                if recent_best > best + EARLY_STOPPING_ACCURACY:
+                    logger.info('early stopping')
+                    break
 
     except KeyboardInterrupt:
-        logging.error('training was interrupted from keyboard')
+        logger.error('interrupted from keyboard')
 
-    logging.info('saving weights')
-    model.save_weights("weights.pkl")
-    logging.info('weights saved')
+    with open('weights.pkl', 'w') as file_:
+        cPickle.dump(
+            lasagne.layers.get_all_param_values(model, trainable=True),
+            file_
+        )
 
-    val_loss = 0.0
-    for batch_data in iter_batches(test_data, BATCH_SIZE, shuffle=False):
-        val_loss += model.loss(batch_data)
-    logging.info('finally val_loss=%f',
-                 val_loss / test_data.shape[0])
-
-    logging.info('completed')
+    logger.info('finally val_loss=%f, raw_loss=%f',
+                f_test(mnist[1][0]), f_raw_loss(mnist[1][0]))
