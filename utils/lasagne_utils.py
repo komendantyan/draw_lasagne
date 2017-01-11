@@ -1,7 +1,8 @@
+import re
 import lasagne.layers as ll
 
 
-__all__ = ['layer_by_name']
+__all__ = ['layer_by_name', 'layers_by_regexp']
 
 
 def layer_by_name(layer, name):
@@ -13,3 +14,13 @@ def layer_by_name(layer, name):
         raise KeyError('no layer with name %s' % name)
     else:
         return ans[0]
+
+
+def layers_by_regexp(layer, pattern):
+    regexp = re.compile(pattern)
+
+    return [
+        l
+        for l in ll.get_all_layers(layer)
+        if l.name is not None and regexp.search(l.name) is not None
+    ]

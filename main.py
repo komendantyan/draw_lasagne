@@ -7,6 +7,7 @@ from __future__ import division
 
 import logging
 import cPickle
+import os
 
 import numpy
 import theano
@@ -23,7 +24,7 @@ import advanced_layers
 import utils
 
 
-BS = 32
+BS = 100
 CH = 1
 IH = 28
 IW = 28
@@ -32,14 +33,14 @@ WW = 7
 
 HS = 100
 
-ENC_NDIM = 5
+ENC_NDIM = 10
 ENC_VAR = 1.0
 
-TIME_ROUNDS = 2
+TIME_ROUNDS = 1
 
-NB_EPOCHS = 500
-EARLY_STOPPING_STEPS = 3
-EARLY_STOPPING_ACCURACY = 1e-4
+NB_EPOCHS = 1000
+EARLY_STOPPING_STEPS = 5
+EARLY_STOPPING_ACCURACY = 0.0
 
 
 logging.basicConfig(
@@ -59,21 +60,35 @@ def make_model():
         name='step1.image'
     )
 
-    h_read = ll.InputLayer(
+    h_read_init = ll.InputLayer(
+        (HS,),
+        lasagne.utils.create_param(li.Uniform(), (HS,),
+                                   name='step1.tensor.h_read_init'),
+        name='step1.h_read_init'
+    )
+    h_read_init.add_param(h_read_init.input_var, (HS,))
+
+    h_write_init = ll.InputLayer(
+        (HS,),
+        lasagne.utils.create_param(li.Uniform(), (HS,),
+                                   name='step1.tensor.h_write_init'),
+        name='step1.h_write_init'
+    )
+    h_write_init.add_param(h_write_init.input_var, (HS,))
+
+    h_read = ll.ExpressionLayer(
+        h_read_init,
+        lambda t: T.tile(T.reshape(t, (1, HS)), (BS, 1)),
         (BS, HS),
-        lasagne.utils.create_param(li.Uniform(), (BS, HS),
-                                   name='step1.tensor.h_read'),
         name='step1.h_read'
     )
-    h_read.add_param(h_read.input_var, (BS, HS))
 
-    h_write = ll.InputLayer(
+    h_write = ll.ExpressionLayer(
+        h_write_init,
+        lambda t: T.tile(T.reshape(t, (1, HS)), (BS, 1)),
         (BS, HS),
-        lasagne.utils.create_param(li.Uniform(), (BS, HS),
-                                   name='step1.tensor.h_write'),
         name='step1.h_write'
     )
-    h_write.add_param(h_write.input_var, (BS, HS))
 
     canvas = ll.InputLayer(
         (BS, CH, IH, IW),
@@ -142,7 +157,7 @@ def make_model():
     canvas_next = ll.ElemwiseSumLayer([canvas, write_image],
                                       name='step1.canvas_next')
 
-    def rename_rule(name):
+    def rename(name):
         if name is None:
             return None
         step, real_name = name.split('.', 1)
@@ -161,7 +176,6 @@ def make_model():
             canvas_next,
             utils.modified_copy(
                 canvas_next,
-                start_layers=[h_read, h_write, canvas],
                 modify={
                     h_read: read_rnn,
                     h_write: write_rnn,
@@ -169,7 +183,7 @@ def make_model():
                     sample.random_stream: sample.random_stream,
                     sample.random_variable: sample_random_variable_next,
                 },
-                rename_rule=rename_rule,
+                rename=rename,
             )
         )
 
@@ -179,15 +193,17 @@ def make_model():
         write_rnn = utils.layer_by_name(canvas_next, 'step%d.write_rnn' % (step + 1))
         sample = utils.layer_by_name(canvas_next, 'step%d.sample' % (step + 1))
 
-    output = ll.NonlinearityLayer(canvas_next, ln.sigmoid,
-                                  name='output')
+    output = ll.NonlinearityLayer(canvas_next, ln.sigmoid, name='output')
 
     return output
 
 
 if __name__ == '__main__':
-    mnist = utils.load_mnist()
+    mnist = utils.load_mnist(process=lambda x: (x > 0.8).astype('float32'))
     model = make_model()
+
+    logger.info('visualize model to model.svg')
+    utils.visualize_model(model, 'model.svg')
 
     image = utils.layer_by_name(model, 'step1.image').input_var
 
@@ -239,6 +255,11 @@ if __name__ == '__main__':
     logger.info('initial val_loss=%f, raw_loss=%f',
                 f_test(mnist[1][0]), f_raw_loss(mnist[1][0]))
 
+    if os.path.exists('init_weights.pkl'):
+        with open('init_weights.pkl') as file_:
+            weights = cPickle.load(file_)
+            ll.set_all_param_values(model, weights, trainable=True)
+
     try:
         val_loss = []
         for epoch in range(1, NB_EPOCHS + 1):
@@ -263,9 +284,25 @@ if __name__ == '__main__':
 
     with open('weights.pkl', 'w') as file_:
         cPickle.dump(
-            lasagne.layers.get_all_param_values(model, trainable=True),
+            ll.get_all_param_values(model, trainable=True),
             file_
         )
 
     logger.info('finally val_loss=%f, raw_loss=%f',
                 f_test(mnist[1][0]), f_raw_loss(mnist[1][0]))
+
+    all_outputs = [
+        ll.NonlinearityLayer(
+            utils.layer_by_name(model, 'step%d.canvas_next' % j),
+            nonlinearity=ln.sigmoid
+        )
+        for j in xrange(1, TIME_ROUNDS + 1)
+    ]
+
+    f_predict_steps_batch = theano.function([image], ll.get_output(all_outputs))
+    f_predict_steps = utils.batch_wrapper(f_predict_steps_batch, BS, cut=True,
+                                          shuffle=False)
+
+    steps_value = f_predict_steps(mnist[1][0])
+    for step, value in enumerate(steps_value, 1):
+        numpy.save('./predictions/last/step%.3d.npy' % step, value)
